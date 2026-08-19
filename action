@@ -1,39 +1,265 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
-shopt -s dotglob nullglob
-trap 'echo "${0} line ${LINENO} Status: ${?}"' ERR
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-CACHE_DIR=$HOME/.apt-cache
-CACHE_TAR=$CACHE_DIR/root.tar.zstd
-CACHE_LOG=$CACHE_DIR/log
-CACHE_FILES=$CACHE_DIR/files
-APT_CACHE_KEY=$(echo "$INPUTS_PACKAGES|$INPUTS_VERSION" | md5sum | awk '{print $1}')
+readonly CACHE_SCHEMA_VERSION="2"
+readonly MIN_UBUNTU_VERSION="24.04"
+readonly MAX_PACKAGE_INPUT_LENGTH="4096"
+readonly MAX_PACKAGE_COUNT="128"
 
-do_pre() {
-  echo "APT_CACHE_KEY=$APT_CACHE_KEY" >>$GITHUB_ENV
+declare -a PACKAGES=()
+OS_ID=""
+OS_VERSION=""
+ARCHITECTURE=""
+CACHE_DIR=""
+
+error() {
+  printf '::error title=apt-install::%s\n' "$*" >&2
 }
 
-do_post() {
-  if [[ -e $CACHE_TAR ]]; then
-    echo Cache hit, restoring from cache.
-    sudo tar xf $CACHE_TAR -C /
-  else
-    echo Cache miss, installing and caching packages.
-    mkdir -p $CACHE_DIR
-    sudo DEBIAN_FRONTEND=noninteractive apt --yes install $INPUTS_PACKAGES | tee $CACHE_LOG
-    local installed=$(cat $CACHE_LOG | grep Unpacking | awk '{print $2}')
-    if [[ -z $installed ]]; then
-      echo WARNING: no packages installed.
-      # create empty tar file to ensure cache hit flow
-      tar cf $CACHE_TAR --zstd -T /dev/null
-    else
-      # collect list of regular files installed by packages, trim leading /
-      echo "$installed" | xargs dpkg -L |
-        while IFS='\n' read -r f; do [[ -f "$f" ]] && echo "${f:1}"; done >$CACHE_FILES
-      tar cf $CACHE_TAR --zstd -C / -T $CACHE_FILES
+die() {
+  error "$@"
+  exit 1
+}
+
+on_error() {
+  local status=$?
+  trap - ERR
+  printf '::error title=apt-install::Unexpected failure at line %s (status %s)\n' \
+    "${BASH_LINENO[0]:-unknown}" "$status" >&2
+  exit "$status"
+}
+trap on_error ERR
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+load_packages() {
+  local raw="${APT_INSTALL_INPUT_PACKAGES:-}"
+  local token
+
+  ((${#raw} <= MAX_PACKAGE_INPUT_LENGTH)) || die "Package input is too large"
+  PACKAGES=()
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+
+    # Supported APT syntax is name, name:architecture, and either form with
+    # an exact =version. Rejecting all other syntax prevents option injection,
+    # glob expansion, removal requests (name-), and ambiguous regex matching.
+    if [[ ! "$token" =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9][a-z0-9-]*)?(=[0-9A-Za-z.+:~_-]+)?$ ]]; then
+      die "Invalid package specification; see the documented accepted forms"
     fi
+
+    PACKAGES+=("$token")
+    ((${#PACKAGES[@]} <= MAX_PACKAGE_COUNT)) || die "Too many package specifications"
+  done < <(printf '%s' "$raw" | LC_ALL=C awk '{ for (i = 1; i <= NF; i++) print $i }')
+
+  ((${#PACKAGES[@]} > 0)) || die "At least one package is required"
+  mapfile -t PACKAGES < <(printf '%s\n' "${PACKAGES[@]}" | LC_ALL=C sort -u)
+}
+
+validate_platform() {
+  require_command apt-get
+  require_command dpkg
+  require_command realpath
+  require_command sha256sum
+
+  [[ -r /etc/os-release ]] || die "Cannot identify the operating system"
+  # /etc/os-release is supplied by the trusted runner image.
+  # shellcheck disable=SC1091
+  source /etc/os-release
+
+  OS_ID="${ID:-}"
+  OS_VERSION="${VERSION_ID:-}"
+  [[ "$OS_ID" == "ubuntu" ]] || die "Only Ubuntu runners are supported (found ${OS_ID:-unknown})"
+  [[ -n "$OS_VERSION" ]] || die "Ubuntu VERSION_ID is missing"
+  dpkg --compare-versions "$OS_VERSION" ge "$MIN_UBUNTU_VERSION" ||
+    die "Ubuntu $MIN_UBUNTU_VERSION or newer is required (found $OS_VERSION)"
+
+  ARCHITECTURE="$(dpkg --print-architecture)"
+  [[ -n "$ARCHITECTURE" ]] || die "Cannot determine the dpkg architecture"
+}
+
+apt_configuration_digest() {
+  local root
+  local file
+  local -a roots=(
+    /etc/apt/sources.list
+    /etc/apt/sources.list.d
+    /etc/apt/preferences
+    /etc/apt/preferences.d
+  )
+
+  {
+    for root in "${roots[@]}"; do
+      if [[ -f "$root" ]]; then
+        printf '%s\0' "$root"
+        sha256sum -- "$root"
+      elif [[ -d "$root" ]]; then
+        while IFS= read -r -d '' file; do
+          printf '%s\0' "$file"
+          sha256sum -- "$file"
+        done < <(find -L "$root" -maxdepth 1 -type f -print0 | LC_ALL=C sort -z)
+      fi
+    done
+  } | sha256sum | awk '{ print $1 }'
+}
+
+write_cache_environment() {
+  local config_digest="$1"
+  local input_digest="$2"
+  local cache_period="$3"
+  local cache_prefix
+
+  [[ -n "${GITHUB_ENV:-}" ]] || die "GITHUB_ENV is not set"
+  [[ -n "${RUNNER_TEMP:-}" ]] || die "RUNNER_TEMP is not set"
+
+  local runner_temp
+  runner_temp="$(realpath -m -- "$RUNNER_TEMP")"
+  [[ "$runner_temp" == /* ]] || die "RUNNER_TEMP must resolve to an absolute path"
+
+  CACHE_DIR="$runner_temp/apt-install/$input_digest/archives"
+  mkdir -p -- "$CACHE_DIR"
+
+  cache_prefix="apt-install-v${CACHE_SCHEMA_VERSION}-${OS_ID}-${OS_VERSION}-${ARCHITECTURE}-${config_digest}-${input_digest}"
+  {
+    printf 'APT_INSTALL_CACHE_DIR=%s\n' "$CACHE_DIR"
+    printf 'APT_INSTALL_CACHE_KEY=%s-%s\n' "$cache_prefix" "$cache_period"
+    printf 'APT_INSTALL_CACHE_RESTORE_KEY=%s-\n' "$cache_prefix"
+  } >>"$GITHUB_ENV"
+}
+
+do_prepare() {
+  local config_digest
+  local input_digest
+  local cache_period
+  local foreign_architectures
+
+  load_packages
+  validate_platform
+
+  config_digest="$(apt_configuration_digest)"
+  foreign_architectures="$(dpkg --print-foreign-architectures | LC_ALL=C sort | paste -sd, -)"
+  input_digest="$({
+    printf 'schema=%s\0' "$CACHE_SCHEMA_VERSION"
+    printf 'os=%s\0' "$OS_ID"
+    printf 'version=%s\0' "$OS_VERSION"
+    printf 'architecture=%s\0' "$ARCHITECTURE"
+    printf 'foreign-architectures=%s\0' "$foreign_architectures"
+    printf 'apt-configuration=%s\0' "$config_digest"
+    printf 'cache-version=%s\0' "${APT_INSTALL_INPUT_VERSION:-}"
+    printf 'package=%s\0' "${PACKAGES[@]}"
+  } | sha256sum | awk '{ print $1 }')"
+  cache_period="$(date -u +%G-W%V)"
+
+  write_cache_environment "$config_digest" "$input_digest" "$cache_period"
+  printf 'Prepared APT archive cache for Ubuntu %s (%s), %s package(s).\n' \
+    "$OS_VERSION" "$ARCHITECTURE" "${#PACKAGES[@]}"
+}
+
+resolve_cache_directory() {
+  [[ -n "${RUNNER_TEMP:-}" ]] || die "RUNNER_TEMP is not set"
+  [[ -n "${APT_INSTALL_CACHE_DIR:-}" ]] || die "APT_INSTALL_CACHE_DIR is not set"
+  [[ ! -L "$APT_INSTALL_CACHE_DIR" ]] || die "The cache directory must not be a symbolic link"
+
+  local runner_temp
+  local cache_prefix
+  local relative
+
+  runner_temp="$(realpath -m -- "$RUNNER_TEMP")"
+  CACHE_DIR="$(realpath -m -- "$APT_INSTALL_CACHE_DIR")"
+  cache_prefix="$runner_temp/apt-install/"
+  [[ "$CACHE_DIR" == "$cache_prefix"* ]] || die "Cache directory is outside RUNNER_TEMP"
+
+  relative="${CACHE_DIR#"$cache_prefix"}"
+  [[ "$relative" =~ ^[0-9a-f]{64}/archives$ ]] || die "Cache directory has an invalid layout"
+}
+
+validate_cached_entries() {
+  local entry
+  shopt -s dotglob nullglob
+
+  for entry in "$CACHE_DIR"/*; do
+    if [[ ! -f "$entry" || -L "$entry" || "$entry" != *.deb ]]; then
+      die "Refusing an unexpected entry in the APT cache"
+    fi
+  done
+
+  shopt -u dotglob nullglob
+}
+
+prepare_cache_for_apt() {
+  mkdir -p -- "$CACHE_DIR"
+  validate_cached_entries
+
+  sudo chown root:root -- "$CACHE_DIR"
+  sudo chmod 0755 -- "$CACHE_DIR"
+  sudo install -d -m 0700 -o _apt -g root -- "$CACHE_DIR/partial"
+}
+
+finish_cache() {
+  local runner_uid
+  local runner_gid
+
+  sudo rm -rf -- "$CACHE_DIR/partial"
+  sudo rm -f -- "$CACHE_DIR/lock"
+
+  runner_uid="$(id -u)"
+  runner_gid="$(id -g)"
+  sudo chown -R "$runner_uid:$runner_gid" -- "$CACHE_DIR"
+  chmod 0755 -- "$CACHE_DIR"
+  validate_cached_entries
+
+  if compgen -G "$CACHE_DIR/*.deb" >/dev/null; then
+    printf 'APT_INSTALL_CACHE_POPULATED=true\n' >>"$GITHUB_ENV"
+  else
+    printf 'APT_INSTALL_CACHE_POPULATED=false\n' >>"$GITHUB_ENV"
+    printf 'No new package archives were downloaded; cache save will be skipped.\n'
   fi
 }
 
-do_$@
+do_install() {
+  local audit_output
+
+  [[ -n "${GITHUB_ENV:-}" ]] || die "GITHUB_ENV is not set"
+  validate_platform
+  load_packages
+  resolve_cache_directory
+  prepare_cache_for_apt
+
+  printf 'Refreshing signed APT package indexes.\n'
+  sudo apt-get \
+    -o Acquire::Retries=3 \
+    -o Dpkg::Use-Pty=0 \
+    --error-on=any \
+    update
+
+  printf 'Installing %s package(s) through APT.\n' "${#PACKAGES[@]}"
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get \
+    -o Acquire::Retries=3 \
+    -o APT::Keep-Downloaded-Packages=true \
+    -o Dpkg::Use-Pty=0 \
+    -o "Dir::Cache::Archives=$CACHE_DIR" \
+    --yes \
+    --no-remove \
+    install "${PACKAGES[@]}"
+
+  audit_output="$(sudo dpkg --audit)"
+  [[ -z "$audit_output" ]] || die "dpkg reported an incomplete package state: $audit_output"
+
+  finish_cache
+}
+
+main() {
+  (($# == 1)) || die "Usage: $0 <prepare|install>"
+
+  case "$1" in
+    prepare) do_prepare ;;
+    install) do_install ;;
+    *) die "Unknown command: $1" ;;
+  esac
+}
+
+main "$@"

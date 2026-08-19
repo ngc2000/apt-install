@@ -1,19 +1,72 @@
-# gh-action-apt-install
+# apt-install
 
-Cache `apt install` in GitHub Actions.
+Install APT packages on GitHub-hosted Ubuntu runners while caching downloaded
+`.deb` archives. This fork is maintained for our internal workflows and targets
+Ubuntu 24.04 and newer.
 
-Essentially, this bundles all installed files into a single zstd compressed
-tarball cached using [actions/cache](https://github.com/actions/cache) for
-future runs. This is much more speedy than going through the `apt install` flow,
-but has various caveats (such as post install scripts are not run).
+Unlike the original action, this action never restores package files directly
+into `/`. Every invocation refreshes signed APT indexes and runs a normal
+`apt-get install`, so `dpkg` records, dependency handling, conffiles, triggers,
+and package maintainer scripts remain authoritative.
 
 ## Usage
 
+Pin the action to a reviewed full commit SHA in consuming workflows:
+
 ```yaml
-- name: Dependencies
-  uses: daaku/gh-action-apt-install@v4
+- name: Install native dependencies
+  uses: ngc2000/apt-install@<full-commit-sha>
   with:
-    packages: luajit libluajit-5.1-dev
+    packages: |
+      libidn-dev
+      libpcap-dev
 ```
 
-Optionally a `version` can be specified to manually bump the cache key.
+`packages` is whitespace-delimited. Supported specifications are `package`,
+`package:architecture`, and either form with an exact `=version`. Shell syntax,
+APT flags, regex/glob matching, release selectors, and removal requests are
+rejected.
+
+The optional `version` input is a manual cache-key salt:
+
+```yaml
+  with:
+    packages: libidn-dev libpcap-dev
+    version: "2"
+```
+
+## Cache behavior
+
+The cache contains only regular `.deb` files downloaded and verified by APT.
+Keys include the Ubuntu release, native and foreign architectures, configured
+APT sources and preferences, normalized package list, cache schema, and the
+manual `version` input. A new primary key is created each UTC week, with the
+previous cache used as a download seed.
+
+An exact cache hit does **not** skip installation. APT still selects the current
+candidate versions from freshly downloaded, signed repository metadata and
+validates cached archives before installing them.
+
+This design optimizes network downloads, not the package-manager work itself.
+For very small packages, plain `apt-get` may be just as fast. For large and
+stable toolchains used across many jobs, a reviewed container image or runner
+image may provide better speed and reproducibility.
+
+See [the security audit](docs/security-audit.md) for the threat model, findings,
+and comparison with other APT caching actions.
+
+## Support
+
+- Ubuntu 24.04 LTS and newer GitHub-hosted runners
+- APT repositories configured before this action runs
+- `actions/cache` v6, pinned to a reviewed commit
+
+Other Linux distributions and Ubuntu releases older than 24.04 fail early.
+Third-party repositories remain the caller's responsibility and should use a
+dedicated keyring plus `Signed-By`.
+
+## License and attribution
+
+MIT licensed. This project is derived from
+[daaku/gh-action-apt-install](https://github.com/daaku/gh-action-apt-install),
+originally written by Naitik Shah. See [NOTICE](NOTICE) and [license](license).

@@ -1,37 +1,61 @@
-name: Cache apt install
-description: Cache apt install.
-author: daaku
+name: Install cached APT packages
+description: Install Ubuntu APT packages normally while caching verified package archives.
+author: ngc2000 contributors (based on daaku/gh-action-apt-install)
 branding:
-  icon: zap
+  icon: package
   color: orange
 
 inputs:
   packages:
-    description: Packages to install.
+    description: >-
+      Whitespace-delimited package specifications. Supports package,
+      package:architecture, and either form with an exact =version.
     required: true
   version:
-    description: Additional version to include.
+    description: Manual cache-key salt. Change this value to force a fresh cache lineage.
     required: false
     default: ""
 
 outputs:
   cache-hit:
-    description: Boolean value to indicate a cache hit occurred.
-    value: ${{ steps.cache.outputs.cache-hit || false }}
+    description: Whether the exact weekly APT archive cache was restored.
+    value: ${{ steps.cache.outputs.cache-hit == 'true' }}
+  cache-key:
+    description: The primary cache key used by this invocation.
+    value: ${{ env.APT_INSTALL_CACHE_KEY }}
 
 runs:
   using: composite
   steps:
-    - run: |
-        echo "INPUTS_VERSION=${{ inputs.version }}" >> $GITHUB_ENV
-        echo "INPUTS_PACKAGES=${{ inputs.packages }}" >> $GITHUB_ENV
+    - id: prepare
+      name: Validate inputs and prepare cache key
+      env:
+        APT_INSTALL_INPUT_PACKAGES: ${{ inputs.packages }}
+        APT_INSTALL_INPUT_VERSION: ${{ inputs.version }}
+      run: '"${GITHUB_ACTION_PATH}/action" prepare'
       shell: bash
-    - run: ${{ github.action_path }}/action pre
-      shell: bash
+
     - id: cache
-      uses: actions/cache@v6
+      name: Restore verified APT archives
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: ~/.apt-cache
-        key: apt-cache-${{ runner.os }}-${{ env.APT_CACHE_KEY }}
-    - run: ${{ github.action_path }}/action post
+        path: ${{ env.APT_INSTALL_CACHE_DIR }}
+        key: ${{ env.APT_INSTALL_CACHE_KEY }}
+        restore-keys: ${{ env.APT_INSTALL_CACHE_RESTORE_KEY }}
+
+    - id: install
+      name: Install packages through APT
+      env:
+        APT_INSTALL_INPUT_PACKAGES: ${{ inputs.packages }}
+      run: '"${GITHUB_ACTION_PATH}/action" install'
       shell: bash
+
+    - id: save
+      name: Save verified APT archives
+      if: >-
+        steps.cache.outputs.cache-hit != 'true' &&
+        env.APT_INSTALL_CACHE_POPULATED == 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ env.APT_INSTALL_CACHE_DIR }}
+        key: ${{ env.APT_INSTALL_CACHE_KEY }}

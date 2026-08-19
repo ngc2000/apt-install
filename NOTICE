@@ -1,0 +1,10 @@
+apt-install
+
+This project is derived from gh-action-apt-install:
+https://github.com/daaku/gh-action-apt-install
+
+Original work copyright (c) 2022 Naitik Shah.
+Subsequent modifications copyright (c) 2026 ngc2000 apt-install contributors.
+
+Both the original work and this derivative are provided under the MIT License.
+See the license file for the complete terms.
