@@ -1,10 +1,10 @@
 # Security audit and design review
 
-Audit date: 2026-08-19
+Audit date: 2026-08-20
 
 Scope: the inherited `action`, `action.yml`, test workflow, dependency update
 configuration, and the APT/cache trust boundary. The intended workload is
-`libidn-dev` and `libpcap-dev` on GitHub-hosted Ubuntu 24.04 and newer.
+`libidn-dev` and `libpcap-dev` on GitHub-hosted Ubuntu 22.04 and newer.
 
 ## Executive decision
 
@@ -25,15 +25,15 @@ equivalent installation.
 
 | Severity | Finding | Resolution |
 | --- | --- | --- |
-| Critical | `inputs.packages` and `inputs.version` were interpolated directly into a generated Bash script. A quote-breaking value could execute arbitrary commands. | Inputs are passed through step environment variables, validated, normalized, and supplied to APT as a Bash array. |
-| High | A cache-controlled tar archive was extracted with `sudo` directly into `/` without validating members. Cache compromise therefore became privileged arbitrary file overwrite. | Root-filesystem archives were removed. Restored cache directories may contain only non-symlink regular `.deb` files. |
+| Critical | `inputs.packages` and `inputs.version` were interpolated directly into a generated Bash script. A quote-breaking value could execute arbitrary commands. | Inputs are passed through step environment variables, validated, normalized, and supplied to APT in a subprocess argument vector. |
+| High | A cache-controlled tar archive was extracted with `sudo` directly into `/` without validating members. Cache compromise therefore became privileged arbitrary file overwrite. | Root-filesystem archives were removed. Restored cache directories may contain only single-link regular `.deb` files. |
 | High | Cache hits copied files without updating the `dpkg` database or running package maintainer scripts and triggers. | Every run uses `apt-get install`; cache hits only avoid some downloads. |
 | High | The cache key omitted Ubuntu version, CPU/dpkg architecture, repositories, preferences, resolved update period, and package-manager schema. Security updates could remain bypassed indefinitely. | The key includes release, architectures, source/preference digest, normalized inputs, schema, manual salt, and a UTC week. APT indexes are refreshed on every run. |
 | High | `actions/cache@v6` and the test action's `@main` reference were mutable supply-chain dependencies. | Third-party actions are pinned to full reviewed commit SHAs; CI tests the local checkout. |
 | Medium | Installed packages were inferred by parsing localized human-readable APT output for `Unpacking`. | No human-readable output is parsed. APT's exit status and `dpkg --audit` determine success. |
-| Medium | Unquoted variables, `xargs`, and newline-sensitive environment-file writes made whitespace and control-data handling brittle. | Paths are quoted, package arguments use arrays, and only generated hashes/paths are written to the environment file. |
+| Medium | Unquoted variables, `xargs`, and newline-sensitive environment-file writes made whitespace and control-data handling brittle. | Python path objects and subprocess argument vectors preserve boundaries, and only generated hashes/paths are written to the environment file. |
 | Low | MD5 was used for cache identity. Collision resistance was not the primary security boundary, but it was an avoidable weakness. | All internal digests use SHA-256. |
-| Low | The action did not define a supported platform or test current Ubuntu releases. | Unsupported systems fail early; CI covers Ubuntu 24.04 and 26.04. |
+| Low | The action did not define a supported platform or test current Ubuntu releases. | Unsupported systems fail early; CI covers Ubuntu 22.04, 24.04, and 26.04. |
 
 ## Threat model
 
@@ -54,8 +54,11 @@ Untrusted or potentially stale inputs:
 Controls:
 
 - strict package grammar prevents command and APT-option injection;
+- the implementation uses Python 3.10-compatible standard-library APIs and
+  passes every privileged command as an argument vector without a shell;
 - cache paths are confined beneath `RUNNER_TEMP` and have a fixed hash layout;
-- symbolic links and every cache entry other than a regular `.deb` are rejected;
+- symbolic links, hard links, and every cache entry other than a regular `.deb`
+  are rejected;
 - `apt-get update --error-on=any` refreshes and authenticates repository state;
 - APT selects candidate versions and validates archive checksums;
 - `--no-remove` prevents an unattended package request from removing packages;
@@ -126,6 +129,8 @@ installation becomes a meaningful share of job time.
 
 - [GitHub Actions secure use](https://docs.github.com/en/actions/reference/security/secure-use)
 - [GitHub dependency caching and cache security](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
+- [Ubuntu 22.04 `apt-get` manual](https://manpages.ubuntu.com/manpages/jammy/man8/apt-get.8.html)
+- [Ubuntu 22.04 `apt-secure` manual](https://manpages.ubuntu.com/manpages/jammy/man8/apt-secure.8.html)
 - [Ubuntu 24.04 `apt-get` manual](https://manpages.ubuntu.com/manpages/noble/man8/apt-get.8.html)
 - [Ubuntu 24.04 `apt-secure` manual](https://manpages.ubuntu.com/manpages/noble/man8/apt-secure.8.html)
 - [Debian Policy: maintainer scripts and installation procedure](https://www.debian.org/doc/debian-policy/ch-maintainerscripts.html)

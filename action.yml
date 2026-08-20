@@ -32,7 +32,7 @@ runs:
       env:
         APT_INSTALL_INPUT_PACKAGES: ${{ inputs.packages }}
         APT_INSTALL_INPUT_VERSION: ${{ inputs.version }}
-      run: '"${GITHUB_ACTION_PATH}/action" prepare'
+      run: /usr/bin/python3 "${GITHUB_ACTION_PATH}/action" prepare
       shell: bash
 
     - id: cache
@@ -47,7 +47,7 @@ runs:
       name: Install packages through APT
       env:
         APT_INSTALL_INPUT_PACKAGES: ${{ inputs.packages }}
-      run: '"${GITHUB_ACTION_PATH}/action" install'
+      run: /usr/bin/python3 "${GITHUB_ACTION_PATH}/action" install
       shell: bash
 
     - id: save

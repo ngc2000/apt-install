@@ -1,265 +1,564 @@
-#!/usr/bin/env bash
+#!/usr/bin/python3
+"""Install Ubuntu packages while caching only APT's downloaded archives."""
 
-set -Eeuo pipefail
-IFS=$'\n\t'
+from __future__ import annotations
 
-readonly CACHE_SCHEMA_VERSION="2"
-readonly MIN_UBUNTU_VERSION="24.04"
-readonly MAX_PACKAGE_INPUT_LENGTH="4096"
-readonly MAX_PACKAGE_COUNT="128"
+import datetime as dt
+import hashlib
+import os
+from pathlib import Path
+import re
+import shlex
+import stat
+import subprocess
+import sys
+from typing import Iterable, NamedTuple, Sequence
 
-declare -a PACKAGES=()
-OS_ID=""
-OS_VERSION=""
-ARCHITECTURE=""
-CACHE_DIR=""
 
-error() {
-  printf '::error title=apt-install::%s\n' "$*" >&2
-}
+CACHE_SCHEMA_VERSION = "3"
+MIN_UBUNTU_VERSION = "22.04"
+MAX_PACKAGE_INPUT_LENGTH = 4096
+MAX_PACKAGE_COUNT = 128
+MAX_CACHE_VERSION_LENGTH = 4096
 
-die() {
-  error "$@"
-  exit 1
-}
+PACKAGE_PATTERN = re.compile(
+    r"^[a-z0-9](?:[a-z0-9+.-]*[a-z0-9+.])?"
+    r"(:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)?"
+    r"(=[0-9A-Za-z.+:~_-]+)?$",
+    re.ASCII,
+)
+CACHE_DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 
-on_error() {
-  local status=$?
-  trap - ERR
-  printf '::error title=apt-install::Unexpected failure at line %s (status %s)\n' \
-    "${BASH_LINENO[0]:-unknown}" "$status" >&2
-  exit "$status"
-}
-trap on_error ERR
+APT_GET = Path("/usr/bin/apt-get")
+CHMOD = Path("/usr/bin/chmod")
+CHOWN = Path("/usr/bin/chown")
+DPKG = Path("/usr/bin/dpkg")
+ENV = Path("/usr/bin/env")
+INSTALL = Path("/usr/bin/install")
+RM = Path("/usr/bin/rm")
+SUDO = Path("/usr/bin/sudo")
 
-require_command() {
-  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
-}
+REQUIRED_COMMANDS = (APT_GET, CHMOD, CHOWN, DPKG, ENV, INSTALL, RM, SUDO)
+APT_CONFIGURATION_ROOTS = (
+    Path("/etc/apt/sources.list"),
+    Path("/etc/apt/sources.list.d"),
+    Path("/etc/apt/preferences"),
+    Path("/etc/apt/preferences.d"),
+)
 
-load_packages() {
-  local raw="${APT_INSTALL_INPUT_PACKAGES:-}"
-  local token
 
-  ((${#raw} <= MAX_PACKAGE_INPUT_LENGTH)) || die "Package input is too large"
-  PACKAGES=()
-  while IFS= read -r token; do
-    [[ -n "$token" ]] || continue
+class ActionError(RuntimeError):
+    """An expected, user-facing action failure."""
 
-    # Supported APT syntax is name, name:architecture, and either form with
-    # an exact =version. Rejecting all other syntax prevents option injection,
-    # glob expansion, removal requests (name-), and ambiguous regex matching.
-    if [[ ! "$token" =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9][a-z0-9-]*)?(=[0-9A-Za-z.+:~_-]+)?$ ]]; then
-      die "Invalid package specification; see the documented accepted forms"
-    fi
 
-    PACKAGES+=("$token")
-    ((${#PACKAGES[@]} <= MAX_PACKAGE_COUNT)) || die "Too many package specifications"
-  done < <(printf '%s' "$raw" | LC_ALL=C awk '{ for (i = 1; i <= NF; i++) print $i }')
+class Platform(NamedTuple):
+    os_id: str
+    version: str
+    architecture: str
 
-  ((${#PACKAGES[@]} > 0)) || die "At least one package is required"
-  mapfile -t PACKAGES < <(printf '%s\n' "${PACKAGES[@]}" | LC_ALL=C sort -u)
-}
 
-validate_platform() {
-  require_command apt-get
-  require_command dpkg
-  require_command realpath
-  require_command sha256sum
+def annotation_escape(value: object) -> str:
+    """Escape data embedded in a GitHub workflow command."""
 
-  [[ -r /etc/os-release ]] || die "Cannot identify the operating system"
-  # /etc/os-release is supplied by the trusted runner image.
-  # shellcheck disable=SC1091
-  source /etc/os-release
+    return (
+        str(value)
+        .replace("%", "%25")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+    )
 
-  OS_ID="${ID:-}"
-  OS_VERSION="${VERSION_ID:-}"
-  [[ "$OS_ID" == "ubuntu" ]] || die "Only Ubuntu runners are supported (found ${OS_ID:-unknown})"
-  [[ -n "$OS_VERSION" ]] || die "Ubuntu VERSION_ID is missing"
-  dpkg --compare-versions "$OS_VERSION" ge "$MIN_UBUNTU_VERSION" ||
-    die "Ubuntu $MIN_UBUNTU_VERSION or newer is required (found $OS_VERSION)"
 
-  ARCHITECTURE="$(dpkg --print-architecture)"
-  [[ -n "$ARCHITECTURE" ]] || die "Cannot determine the dpkg architecture"
-}
+def emit_error(message: object) -> None:
+    print(
+        f"::error title=apt-install::{annotation_escape(message)}",
+        file=sys.stderr,
+    )
 
-apt_configuration_digest() {
-  local root
-  local file
-  local -a roots=(
-    /etc/apt/sources.list
-    /etc/apt/sources.list.d
-    /etc/apt/preferences
-    /etc/apt/preferences.d
-  )
 
-  {
-    for root in "${roots[@]}"; do
-      if [[ -f "$root" ]]; then
-        printf '%s\0' "$root"
-        sha256sum -- "$root"
-      elif [[ -d "$root" ]]; then
-        while IFS= read -r -d '' file; do
-          printf '%s\0' "$file"
-          sha256sum -- "$file"
-        done < <(find -L "$root" -maxdepth 1 -type f -print0 | LC_ALL=C sort -z)
-      fi
-    done
-  } | sha256sum | awk '{ print $1 }'
-}
+def emit_warning(message: object) -> None:
+    print(
+        f"::warning title=apt-install::{annotation_escape(message)}",
+        file=sys.stderr,
+    )
 
-write_cache_environment() {
-  local config_digest="$1"
-  local input_digest="$2"
-  local cache_period="$3"
-  local cache_prefix
 
-  [[ -n "${GITHUB_ENV:-}" ]] || die "GITHUB_ENV is not set"
-  [[ -n "${RUNNER_TEMP:-}" ]] || die "RUNNER_TEMP is not set"
+def fail(message: str) -> None:
+    raise ActionError(message)
 
-  local runner_temp
-  runner_temp="$(realpath -m -- "$RUNNER_TEMP")"
-  [[ "$runner_temp" == /* ]] || die "RUNNER_TEMP must resolve to an absolute path"
 
-  CACHE_DIR="$runner_temp/apt-install/$input_digest/archives"
-  mkdir -p -- "$CACHE_DIR"
+def run_command(
+    arguments: Sequence[object],
+    *,
+    capture_stdout: bool = False,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    command = [os.fspath(argument) for argument in arguments]
+    return subprocess.run(
+        command,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE if capture_stdout else None,
+    )
 
-  cache_prefix="apt-install-v${CACHE_SCHEMA_VERSION}-${OS_ID}-${OS_VERSION}-${ARCHITECTURE}-${config_digest}-${input_digest}"
-  {
-    printf 'APT_INSTALL_CACHE_DIR=%s\n' "$CACHE_DIR"
-    printf 'APT_INSTALL_CACHE_KEY=%s-%s\n' "$cache_prefix" "$cache_period"
-    printf 'APT_INSTALL_CACHE_RESTORE_KEY=%s-\n' "$cache_prefix"
-  } >>"$GITHUB_ENV"
-}
 
-do_prepare() {
-  local config_digest
-  local input_digest
-  local cache_period
-  local foreign_architectures
+def require_commands() -> None:
+    for command in REQUIRED_COMMANDS:
+        if not command.is_file() or not os.access(command, os.X_OK):
+            fail(f"Required command not found: {command}")
 
-  load_packages
-  validate_platform
 
-  config_digest="$(apt_configuration_digest)"
-  foreign_architectures="$(dpkg --print-foreign-architectures | LC_ALL=C sort | paste -sd, -)"
-  input_digest="$({
-    printf 'schema=%s\0' "$CACHE_SCHEMA_VERSION"
-    printf 'os=%s\0' "$OS_ID"
-    printf 'version=%s\0' "$OS_VERSION"
-    printf 'architecture=%s\0' "$ARCHITECTURE"
-    printf 'foreign-architectures=%s\0' "$foreign_architectures"
-    printf 'apt-configuration=%s\0' "$config_digest"
-    printf 'cache-version=%s\0' "${APT_INSTALL_INPUT_VERSION:-}"
-    printf 'package=%s\0' "${PACKAGES[@]}"
-  } | sha256sum | awk '{ print $1 }')"
-  cache_period="$(date -u +%G-W%V)"
+def parse_packages(raw: str) -> list[str]:
+    if len(raw) > MAX_PACKAGE_INPUT_LENGTH:
+        fail("Package input is too large")
 
-  write_cache_environment "$config_digest" "$input_digest" "$cache_period"
-  printf 'Prepared APT archive cache for Ubuntu %s (%s), %s package(s).\n' \
-    "$OS_VERSION" "$ARCHITECTURE" "${#PACKAGES[@]}"
-}
+    packages = raw.split()
+    if not packages:
+        fail("At least one package is required")
+    if len(packages) > MAX_PACKAGE_COUNT:
+        fail("Too many package specifications")
 
-resolve_cache_directory() {
-  [[ -n "${RUNNER_TEMP:-}" ]] || die "RUNNER_TEMP is not set"
-  [[ -n "${APT_INSTALL_CACHE_DIR:-}" ]] || die "APT_INSTALL_CACHE_DIR is not set"
-  [[ ! -L "$APT_INSTALL_CACHE_DIR" ]] || die "The cache directory must not be a symbolic link"
+    for package in packages:
+        # Only name, name:architecture, and either form with an exact =version
+        # are accepted. This excludes options, globs, removal requests, and
+        # release selectors before any value reaches APT.
+        if PACKAGE_PATTERN.fullmatch(package) is None:
+            fail(
+                "Invalid package specification; see the documented accepted forms"
+            )
 
-  local runner_temp
-  local cache_prefix
-  local relative
+    return sorted(set(packages))
 
-  runner_temp="$(realpath -m -- "$RUNNER_TEMP")"
-  CACHE_DIR="$(realpath -m -- "$APT_INSTALL_CACHE_DIR")"
-  cache_prefix="$runner_temp/apt-install/"
-  [[ "$CACHE_DIR" == "$cache_prefix"* ]] || die "Cache directory is outside RUNNER_TEMP"
 
-  relative="${CACHE_DIR#"$cache_prefix"}"
-  [[ "$relative" =~ ^[0-9a-f]{64}/archives$ ]] || die "Cache directory has an invalid layout"
-}
+def load_packages() -> list[str]:
+    return parse_packages(os.environ.get("APT_INSTALL_INPUT_PACKAGES", ""))
 
-validate_cached_entries() {
-  local entry
-  shopt -s dotglob nullglob
 
-  for entry in "$CACHE_DIR"/*; do
-    if [[ ! -f "$entry" || -L "$entry" || "$entry" != *.deb ]]; then
-      die "Refusing an unexpected entry in the APT cache"
-    fi
-  done
+def load_cache_version() -> str:
+    value = os.environ.get("APT_INSTALL_INPUT_VERSION", "")
+    if len(value) > MAX_CACHE_VERSION_LENGTH:
+        fail("Cache version input is too large")
+    return value
 
-  shopt -u dotglob nullglob
-}
 
-prepare_cache_for_apt() {
-  mkdir -p -- "$CACHE_DIR"
-  validate_cached_entries
+def parse_os_release(contents: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
 
-  sudo chown root:root -- "$CACHE_DIR"
-  sudo chmod 0755 -- "$CACHE_DIR"
-  sudo install -d -m 0700 -o _apt -g root -- "$CACHE_DIR/partial"
-}
+    for raw_line in contents.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
 
-finish_cache() {
-  local runner_uid
-  local runner_gid
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or key not in {"ID", "VERSION_ID"}:
+            continue
 
-  sudo rm -rf -- "$CACHE_DIR/partial"
-  sudo rm -f -- "$CACHE_DIR/lock"
+        lexer = shlex.shlex(value, posix=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        try:
+            tokens = list(lexer)
+        except ValueError as error:
+            raise ActionError("Cannot parse /etc/os-release") from error
 
-  runner_uid="$(id -u)"
-  runner_gid="$(id -g)"
-  sudo chown -R "$runner_uid:$runner_gid" -- "$CACHE_DIR"
-  chmod 0755 -- "$CACHE_DIR"
-  validate_cached_entries
+        if not tokens:
+            fields[key] = ""
+        elif len(tokens) == 1:
+            fields[key] = tokens[0]
+        else:
+            fail("Cannot parse /etc/os-release")
 
-  if compgen -G "$CACHE_DIR/*.deb" >/dev/null; then
-    printf 'APT_INSTALL_CACHE_POPULATED=true\n' >>"$GITHUB_ENV"
-  else
-    printf 'APT_INSTALL_CACHE_POPULATED=false\n' >>"$GITHUB_ENV"
-    printf 'No new package archives were downloaded; cache save will be skipped.\n'
-  fi
-}
+    return fields
 
-do_install() {
-  local audit_output
 
-  [[ -n "${GITHUB_ENV:-}" ]] || die "GITHUB_ENV is not set"
-  validate_platform
-  load_packages
-  resolve_cache_directory
-  prepare_cache_for_apt
+def validate_platform(os_release_path: Path = Path("/etc/os-release")) -> Platform:
+    require_commands()
+    if not os_release_path.is_file():
+        fail("Cannot identify the operating system")
 
-  printf 'Refreshing signed APT package indexes.\n'
-  sudo apt-get \
-    -o Acquire::Retries=3 \
-    -o Dpkg::Use-Pty=0 \
-    --error-on=any \
-    update
+    fields = parse_os_release(os_release_path.read_text(encoding="utf-8"))
+    os_id = fields.get("ID", "")
+    version = fields.get("VERSION_ID", "")
 
-  printf 'Installing %s package(s) through APT.\n' "${#PACKAGES[@]}"
-  sudo env DEBIAN_FRONTEND=noninteractive apt-get \
-    -o Acquire::Retries=3 \
-    -o APT::Keep-Downloaded-Packages=true \
-    -o Dpkg::Use-Pty=0 \
-    -o "Dir::Cache::Archives=$CACHE_DIR" \
-    --yes \
-    --no-remove \
-    install "${PACKAGES[@]}"
+    if os_id != "ubuntu":
+        fail(f"Only Ubuntu runners are supported (found {os_id or 'unknown'})")
+    if not version:
+        fail("Ubuntu VERSION_ID is missing")
 
-  audit_output="$(sudo dpkg --audit)"
-  [[ -z "$audit_output" ]] || die "dpkg reported an incomplete package state: $audit_output"
+    comparison = run_command(
+        [DPKG, "--compare-versions", version, "ge", MIN_UBUNTU_VERSION],
+        check=False,
+    )
+    if comparison.returncode == 1:
+        fail(
+            f"Ubuntu {MIN_UBUNTU_VERSION} or newer is required "
+            f"(found {version})"
+        )
+    if comparison.returncode != 0:
+        fail("Cannot compare the Ubuntu version")
 
-  finish_cache
-}
+    architecture = run_command(
+        [DPKG, "--print-architecture"], capture_stdout=True
+    ).stdout.strip()
+    if not architecture:
+        fail("Cannot determine the dpkg architecture")
 
-main() {
-  (($# == 1)) || die "Usage: $0 <prepare|install>"
+    return Platform(os_id, version, architecture)
 
-  case "$1" in
-    prepare) do_prepare ;;
-    install) do_install ;;
-    *) die "Unknown command: $1" ;;
-  esac
-}
 
-main "$@"
+def hash_file(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def apt_configuration_digest(
+    roots: Iterable[Path] = APT_CONFIGURATION_ROOTS,
+) -> str:
+    digest = hashlib.sha256()
+
+    for root in roots:
+        files: list[Path]
+        if root.is_file():
+            files = [root]
+        elif root.is_dir():
+            files = sorted(
+                (path for path in root.iterdir() if path.is_file()),
+                key=lambda path: os.fsencode(path.name),
+            )
+        else:
+            continue
+
+        for path in files:
+            mode = path.stat().st_mode
+            if not stat.S_ISREG(mode):
+                continue
+            digest.update(os.fsencode(path))
+            digest.update(b"\0")
+            digest.update(hash_file(path))
+            digest.update(b"\0")
+
+    return digest.hexdigest()
+
+
+def digest_fields(fields: Iterable[tuple[str, str]]) -> str:
+    digest = hashlib.sha256()
+    for name, value in fields:
+        digest.update(name.encode("utf-8"))
+        digest.update(b"=")
+        digest.update(value.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def input_digest(
+    platform: Platform,
+    foreign_architectures: Sequence[str],
+    configuration_digest: str,
+    cache_version: str,
+    packages: Sequence[str],
+) -> str:
+    fields = [
+        ("schema", CACHE_SCHEMA_VERSION),
+        ("os", platform.os_id),
+        ("version", platform.version),
+        ("architecture", platform.architecture),
+        ("foreign-architectures", ",".join(sorted(foreign_architectures))),
+        ("apt-configuration", configuration_digest),
+        ("cache-version", cache_version),
+    ]
+    fields.extend(("package", package) for package in packages)
+    return digest_fields(fields)
+
+
+def required_absolute_path(name: str) -> Path:
+    value = os.environ.get(name, "")
+    if not value:
+        fail(f"{name} is not set")
+    if "\r" in value or "\n" in value:
+        fail(f"{name} contains a line break")
+
+    path = Path(value)
+    if not path.is_absolute():
+        fail(f"{name} must be an absolute path")
+    return path
+
+
+def append_github_environment(entries: Iterable[tuple[str, str]]) -> None:
+    environment_file = required_absolute_path("GITHUB_ENV")
+    with environment_file.open("a", encoding="utf-8", newline="\n") as output:
+        for name, value in entries:
+            if "\r" in name or "\n" in name or "\r" in value or "\n" in value:
+                fail("Refusing a multiline GitHub environment value")
+            output.write(f"{name}={value}\n")
+
+
+def resolve_cache_directory_from_values(
+    runner_temp_value: str,
+    cache_directory_value: str,
+) -> Path:
+    if not runner_temp_value or not cache_directory_value:
+        fail("Cache path environment is incomplete")
+    if any(character in runner_temp_value for character in "\r\n"):
+        fail("RUNNER_TEMP contains a line break")
+    if any(character in cache_directory_value for character in "\r\n"):
+        fail("APT_INSTALL_CACHE_DIR contains a line break")
+
+    runner_temp_input = Path(runner_temp_value)
+    cache_directory = Path(cache_directory_value)
+    if not runner_temp_input.is_absolute():
+        fail("RUNNER_TEMP must be an absolute path")
+    if not cache_directory.is_absolute():
+        fail("APT_INSTALL_CACHE_DIR must be an absolute path")
+
+    runner_temp = runner_temp_input.resolve(strict=False)
+    cache_root = runner_temp / "apt-install"
+    try:
+        relative = cache_directory.relative_to(cache_root)
+    except ValueError as error:
+        raise ActionError("Cache directory is outside RUNNER_TEMP") from error
+
+    if (
+        len(relative.parts) != 2
+        or CACHE_DIGEST_PATTERN.fullmatch(relative.parts[0]) is None
+        or relative.parts[1] != "archives"
+    ):
+        fail("Cache directory has an invalid layout")
+
+    digest_directory = cache_root / relative.parts[0]
+    for path in (cache_root, digest_directory, cache_directory):
+        if path.is_symlink():
+            fail("The cache path must not contain a symbolic link")
+
+    if cache_directory.resolve(strict=False) != cache_directory:
+        fail("The cache path must resolve without symbolic links")
+
+    return cache_directory
+
+
+def resolve_cache_directory() -> Path:
+    return resolve_cache_directory_from_values(
+        os.environ.get("RUNNER_TEMP", ""),
+        os.environ.get("APT_INSTALL_CACHE_DIR", ""),
+    )
+
+
+def create_cache_directory(runner_temp: Path, package_digest: str) -> Path:
+    cache_root = runner_temp / "apt-install"
+    digest_directory = cache_root / package_digest
+    cache_directory = digest_directory / "archives"
+
+    for directory in (cache_root, digest_directory, cache_directory):
+        if directory.is_symlink():
+            fail("The cache path must not contain a symbolic link")
+        directory.mkdir(exist_ok=True)
+        if directory.is_symlink():
+            fail("The cache path must not contain a symbolic link")
+
+    return resolve_cache_directory_from_values(
+        str(runner_temp), str(cache_directory)
+    )
+
+
+def validate_cached_entries(cache_directory: Path) -> list[Path]:
+    archives: list[Path] = []
+
+    with os.scandir(cache_directory) as entries:
+        for entry in entries:
+            metadata = entry.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or (os.name == "posix" and metadata.st_nlink != 1)
+                or not entry.name.endswith(".deb")
+            ):
+                fail("Refusing an unexpected entry in the APT cache")
+            archives.append(Path(entry.path))
+
+    return archives
+
+
+def prepare_cache_for_apt(cache_directory: Path) -> None:
+    cache_directory.mkdir(parents=True, exist_ok=True)
+    validate_cached_entries(cache_directory)
+
+    run_command([SUDO, CHOWN, "root:root", "--", cache_directory])
+    run_command([SUDO, CHMOD, "0755", "--", cache_directory])
+    run_command(
+        [
+            SUDO,
+            INSTALL,
+            "-d",
+            "-m",
+            "0700",
+            "-o",
+            "_apt",
+            "-g",
+            "root",
+            "--",
+            cache_directory / "partial",
+        ]
+    )
+
+
+def release_cache_ownership(cache_directory: Path) -> None:
+    run_command([SUDO, RM, "-rf", "--", cache_directory / "partial"])
+    run_command([SUDO, RM, "-f", "--", cache_directory / "lock"])
+    run_command(
+        [
+            SUDO,
+            CHOWN,
+            "-R",
+            f"{os.getuid()}:{os.getgid()}",
+            "--",
+            cache_directory,
+        ]
+    )
+    cache_directory.chmod(0o755)
+
+
+def finish_cache(cache_directory: Path) -> None:
+    release_cache_ownership(cache_directory)
+    archives = validate_cached_entries(cache_directory)
+
+    populated = "true" if archives else "false"
+    append_github_environment([("APT_INSTALL_CACHE_POPULATED", populated)])
+    if not archives:
+        print("No new package archives were downloaded; cache save will be skipped.")
+
+
+def do_prepare() -> None:
+    packages = load_packages()
+    platform = validate_platform()
+    configuration_digest = apt_configuration_digest()
+    cache_version = load_cache_version()
+    foreign_architectures = sorted(
+        filter(
+            None,
+            run_command(
+                [DPKG, "--print-foreign-architectures"], capture_stdout=True
+            ).stdout.splitlines(),
+        )
+    )
+    package_digest = input_digest(
+        platform,
+        foreign_architectures,
+        configuration_digest,
+        cache_version,
+        packages,
+    )
+    cache_period = dt.datetime.now(dt.timezone.utc).strftime("%G-W%V")
+
+    runner_temp = required_absolute_path("RUNNER_TEMP").resolve(strict=False)
+    cache_directory = create_cache_directory(runner_temp, package_digest)
+
+    cache_prefix = (
+        f"apt-install-v{CACHE_SCHEMA_VERSION}-{platform.os_id}-"
+        f"{platform.version}-{platform.architecture}-"
+        f"{configuration_digest}-{package_digest}"
+    )
+    append_github_environment(
+        [
+            ("APT_INSTALL_CACHE_DIR", str(cache_directory)),
+            ("APT_INSTALL_CACHE_KEY", f"{cache_prefix}-{cache_period}"),
+            ("APT_INSTALL_CACHE_RESTORE_KEY", f"{cache_prefix}-"),
+        ]
+    )
+    print(
+        f"Prepared APT archive cache for Ubuntu {platform.version} "
+        f"({platform.architecture}), {len(packages)} package(s)."
+    )
+
+
+def do_install() -> None:
+    packages = load_packages()
+    validate_platform()
+    required_absolute_path("GITHUB_ENV")
+    cache_directory = resolve_cache_directory()
+
+    cache_prepared = False
+    try:
+        prepare_cache_for_apt(cache_directory)
+        cache_prepared = True
+
+        print("Refreshing signed APT package indexes.")
+        run_command(
+            [
+                SUDO,
+                APT_GET,
+                "-o",
+                "Acquire::Retries=3",
+                "-o",
+                "Dpkg::Use-Pty=0",
+                "--error-on=any",
+                "update",
+            ]
+        )
+
+        print(f"Installing {len(packages)} package(s) through APT.")
+        run_command(
+            [
+                SUDO,
+                ENV,
+                "DEBIAN_FRONTEND=noninteractive",
+                APT_GET,
+                "-o",
+                "Acquire::Retries=3",
+                "-o",
+                "APT::Keep-Downloaded-Packages=true",
+                "-o",
+                "Dpkg::Use-Pty=0",
+                "-o",
+                f"Dir::Cache::Archives={cache_directory}",
+                "--yes",
+                "--no-remove",
+                "install",
+                *packages,
+            ]
+        )
+
+        audit_output = run_command(
+            [SUDO, DPKG, "--audit"], capture_stdout=True
+        ).stdout.strip()
+        if audit_output:
+            fail(f"dpkg reported an incomplete package state: {audit_output[:1000]}")
+    except Exception:
+        if cache_prepared:
+            try:
+                release_cache_ownership(cache_directory)
+            except Exception as cleanup_error:
+                # Cleanup must not hide the package-manager failure.
+                emit_warning(f"Could not clean the APT cache: {cleanup_error}")
+        raise
+
+    finish_cache(cache_directory)
+
+
+def main(arguments: Sequence[str] | None = None) -> None:
+    command_line = list(sys.argv[1:] if arguments is None else arguments)
+    if len(command_line) != 1:
+        fail(f"Usage: {sys.argv[0]} <prepare|install>")
+
+    command = command_line[0]
+    if command == "prepare":
+        do_prepare()
+    elif command == "install":
+        do_install()
+    else:
+        fail(f"Unknown command: {command}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ActionError as error:
+        emit_error(error)
+        raise SystemExit(1) from None
+    except subprocess.CalledProcessError as error:
+        emit_error(f"Command failed with status {error.returncode}")
+        raise SystemExit(1) from None
+    except Exception as error:
+        # Convert unexpected failures into an escaped workflow annotation.
+        emit_error(f"Unexpected {type(error).__name__}: {str(error)[:1000]}")
+        raise SystemExit(1) from None

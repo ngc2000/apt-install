@@ -2,7 +2,7 @@
 
 Install APT packages on GitHub-hosted Ubuntu runners while caching downloaded
 `.deb` archives. This fork is maintained for our internal workflows and targets
-Ubuntu 24.04 and newer.
+Ubuntu 22.04 and newer.
 
 Unlike the original action, this action never restores package files directly
 into `/`. Every invocation refreshes signed APT indexes and runs a normal
@@ -57,11 +57,12 @@ and comparison with other APT caching actions.
 
 ## Support
 
-- Ubuntu 24.04 LTS and newer GitHub-hosted runners
+- Ubuntu 22.04 LTS and newer GitHub-hosted runners
+- The system `/usr/bin/python3` (Python 3.10 or newer; no third-party modules)
 - APT repositories configured before this action runs
 - `actions/cache` v6, pinned to a reviewed commit
 
-Other Linux distributions and Ubuntu releases older than 24.04 fail early.
+Other Linux distributions and Ubuntu releases older than 22.04 fail early.
 Third-party repositories remain the caller's responsibility and should use a
 dedicated keyring plus `Signed-By`.
 
