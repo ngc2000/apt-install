@@ -1,29 +1,80 @@
 name: Test
+
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
-    inputs:
-      version:
-        description: Additional version to include.
-        required: false
-        default: ""
+
+permissions:
+  contents: read
+
 jobs:
-  test-luajit:
-    name: Test LuaJIT
-    runs-on: ubuntu-latest
+  static:
+    name: Static checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
     steps:
-    - run: test -e /usr/bin/luajit || echo No luajit.
-    - uses: daaku/gh-action-apt-install@main
-      with:
-        packages: luajit
-        version: ${{ github.event.inputs.version }}
-    - run: test -e /usr/bin/luajit && echo Found luajit.
-  test-no-packages:
-    name: Test No Packages
-    runs-on: ubuntu-latest
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check Python syntax
+        run: /usr/bin/python3 -m py_compile action tests/test_action.py
+      - name: Run unit tests
+        run: /usr/bin/python3 -m unittest discover -s tests -v
+
+  integration:
+    name: Install on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-26.04
     steps:
-    - uses: daaku/gh-action-apt-install@main
-      with:
-        packages: dash
-        version: ${{ github.event.inputs.version }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: apt
+        name: Install the production dependency set
+        uses: ./
+        with:
+          packages: |
+            libpcap-dev
+            libidn-dev
+            libpcap-dev
+
+      - name: Verify package-manager and compiler state
+        run: |
+          test "$(dpkg-query -W -f='${db:Status-Status}' libidn-dev)" = installed
+          test "$(dpkg-query -W -f='${db:Status-Status}' libpcap-dev)" = installed
+          test -f /usr/include/idna.h
+          test -f /usr/include/pcap/pcap.h
+          pkg-config --exists libidn libpcap
+          printf '%s\n' \
+            '#include <idna.h>' \
+            '#include <pcap/pcap.h>' \
+            'int main(void) {' \
+            '  return idna_strerror(IDNA_SUCCESS) && pcap_lib_version() ? 0 : 1;' \
+            '}' |
+            cc -x c - -o "$RUNNER_TEMP/apt-install-smoke" \
+              $(pkg-config --cflags --libs libidn libpcap)
+          "$RUNNER_TEMP/apt-install-smoke"
+
+      - id: injection
+        name: Reject shell-injection syntax
+        continue-on-error: true
+        uses: ./
+        with:
+          packages: 'libidn-dev"; touch "$RUNNER_TEMP/apt-install-injected"; #'
+
+      - name: Verify malicious input stayed inert
+        env:
+          INJECTION_OUTCOME: ${{ steps.injection.outcome }}
+        run: |
+          test "$INJECTION_OUTCOME" = failure
+          test ! -e "$RUNNER_TEMP/apt-install-injected"
